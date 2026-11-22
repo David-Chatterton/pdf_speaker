@@ -70,8 +70,7 @@ Voice model choice affects CPU load substantially: in testing,
 | Zoom / speed | toolbar |
 
 Clicking sets a blue outline on the word. The shaded yellow region is the
-utterance currently being spoken (up to two sentences). The view follows it
-onto the next page.
+sentence currently being spoken. The view follows it onto the next page.
 
 Any page change — typed number, spinner arrows, buttons or arrow keys — also
 moves the reading cursor to the first extractable word on that page. If
@@ -99,8 +98,9 @@ pdftotext -bbox-layout  ->  word stream (text + PDF coordinates)
   top-left origin — the same coordinate space Poppler renders into. That
   makes click-to-word a simple nearest-box search, with no OCR or fuzzy text
   matching.
-* `make_chunks()` groups the flat word stream into utterances of up to
-  `SENTENCES_PER_CHUNK` sentences and `MAX_WORDS_PER_CHUNK` words. Chunks may
+* `make_chunks()` groups the flat word stream into utterances of one sentence
+  each. A generous `MAX_WORDS_PER_CHUNK = 500` ceiling only breaks up pages
+  with no sentence punctuation at all (indexes, code listings). Chunks may
   cross pages; the highlight and auto page change follow the word indices.
 * `Speaker` keeps the state machine (current chunk, playing/paused) and an
   `epoch` counter. `speechd` fires END/CANCEL on its own thread; those events
@@ -128,18 +128,16 @@ Resume always works; the cost is at most one repeated chunk.
 ### The between-utterance gap
 
 Piper loads its voice for every utterance when it is invoked as a separate
-process; a measured load time was around 0.63 s. That is the source of the
-pause between sentences.
+process; a measured load time was around 0.63 s with the original voice. That
+is the source of the pause between sentences. A lighter voice model reduces
+this substantially and makes one-sentence utterances practical.
 
-The low-risk mitigation used in this project is to group two sentences into each
-utterance (`SENTENCES_PER_CHUNK = 2`) while keeping a 45-word ceiling
-(`MAX_WORDS_PER_CHUNK = 45`). On the test PDF that reduced the number of voice
-loads by about 31% (941 → 652 utterances) with no increase in worst-case pause
-rewind — 45 words either way. The average utterance grows from 23 to 33 words,
-so a pause re-speaks slightly more text on average. Both are one-line
-constants at the top of `pdf_speaker.py`; setting `SENTENCES_PER_CHUNK = 1`
-restores the original behaviour, and lowering `MAX_WORDS_PER_CHUNK` reduces
-the rewind further.
+Each utterance is exactly one sentence, so no sentence is cut short. An early
+version grouped two sentences per utterance with a 45-word ceiling, but that
+ceiling truncated longer second sentences. The current version drops the
+grouping and raises the ceiling to 500 words — high enough never to split a
+normal sentence, but still a safety valve for unpunctuated runs such as indexes.
+`MAX_WORDS_PER_CHUNK` at the top of `pdf_speaker.py` controls that ceiling.
 
 Replacing the audio pipeline (piper → WAV → mpv IPC) would give gapless
 playback and exact pause, but it duplicates the voice configuration, adds a

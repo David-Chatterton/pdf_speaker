@@ -3,10 +3,10 @@
 
 Design constraint: with the sd_generic -> piper -> paplay module, a speech
 message is one opaque audio stream.  speech-dispatcher cannot pause it.
-So we speak short groups of sentences one at a time and implement pause as
-"stop the current chunk, resume it from its beginning".  Predictable beats
-sample-accurate here.  Grouping two sentences per utterance halves the
-number of piper restarts (each costs ~0.6 s of voice-load time).
+So we speak one sentence at a time and implement pause as "stop the current
+chunk, resume it from its beginning".  Predictable beats sample-accurate here.
+Sentences are never split merely for length; only unpunctuated runs such as
+indexes get broken up by a generous safety ceiling.
 """
 
 import argparse
@@ -29,11 +29,10 @@ gi.require_version("Gdk", "3.0")
 gi.require_version("Poppler", "0.18")
 from gi.repository import Gdk, GLib, Gtk, Poppler
 
-# Each utterance costs ~0.6 s to load the piper voice.  Two sentences per
-# utterance cuts the number of loads by ~30% while keeping the worst-case
-# pause rewind at the same 45-word ceiling as a single sentence.
-SENTENCES_PER_CHUNK = 2
-MAX_WORDS_PER_CHUNK = 45
+# One sentence per utterance.  The ceiling is only a safety valve for pages
+# with no sentence punctuation at all (indexes, code listings); it is high
+# enough never to truncate a normal sentence.
+MAX_WORDS_PER_CHUNK = 500
 DEFAULT_SCALE = 1.4          # pixels per PDF point (~100 dpi)
 SENTENCE_END = re.compile(r"[.!?][\"'\u2019\u201d)\]]*$")
 
@@ -112,35 +111,24 @@ def load_words(path):
     return pages, flat
 
 
-def make_chunks(words, start=0, max_words=MAX_WORDS_PER_CHUNK,
-                sentences=SENTENCES_PER_CHUNK):
-    """Turn a word stream into (start_index, end_index, text) utterances."""
-    chunks, cur, chunk_start, count = [], [], start, 0
+def make_chunks(words, start=0, max_words=MAX_WORDS_PER_CHUNK):
+    """Turn a word stream into (start_index, end_index, text) utterances.
+
+    One sentence per utterance.  The word ceiling is only a safety valve for
+    pages with no sentence punctuation at all (indexes, code listings).
+    """
+    chunks, cur, chunk_start = [], [], start
     for i in range(start, len(words)):
         cur.append(i)
         at_end = bool(SENTENCE_END.search(words[i].text))
-        if at_end:
-            count += 1
-        if (at_end and count >= sentences) or len(cur) >= max_words:
+        if at_end or len(cur) >= max_words:
             chunks.append((chunk_start, i + 1,
                            " ".join(words[j].text for j in cur)))
-            cur, chunk_start, count = [], i + 1, 0
+            cur, chunk_start = [], i + 1
     if cur:
         chunks.append((chunk_start, len(words),
                        " ".join(words[j].text for j in cur)))
-
-    # Lone punctuation (list markers, running heads) makes a useless
-    # utterance. Fold such fragments into their neighbour.
-    merged = []
-    for start, end, text in chunks:
-        prev_start = merged[-1][0] if merged else None
-        if prev_start is not None and end - start < 3 \
-                and end - prev_start <= max_words:
-            merged[-1] = (prev_start, end,
-                          " ".join(w.text for w in words[prev_start:end]))
-        else:
-            merged.append((start, end, text))
-    return merged
+    return chunks
 
 
 # --------------------------------------------------------------------------
