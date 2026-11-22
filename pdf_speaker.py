@@ -283,6 +283,8 @@ class App:
         self.speaker = None
         self.path = None
         self.rate_warned = False
+        self._syncing_page = False
+        self._page_timer = None
 
         self.window = Gtk.Window(title="PDF Speaker")
         self.window.set_default_size(900, 780)
@@ -328,10 +330,21 @@ class App:
         button("■ _Stop", lambda b: self.stop(), "S")
         bar.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL),
                        False, False, 4)
-        button("◀ Page", lambda b: self.set_page(self.page_no - 1), "Left")
-        button("Page ▶", lambda b: self.set_page(self.page_no + 1), "Right")
-        self.page_label = Gtk.Label(label="– / –")
-        bar.pack_start(self.page_label, False, False, 4)
+        button("◀ Page", lambda b: self.jump_to_page(self.page_no - 1),
+               "Left")
+        button("Page ▶", lambda b: self.jump_to_page(self.page_no + 1),
+               "Right")
+        self.page_spin = Gtk.SpinButton.new_with_range(1, 1, 1)
+        self.page_spin.set_numeric(True)
+        self.page_spin.set_digits(0)
+        self.page_spin.set_update_policy(Gtk.SpinButtonUpdatePolicy.IF_VALID)
+        self.page_spin.set_width_chars(5)
+        self.page_spin.set_tooltip_text("Page number — type one and press Enter")
+        self.page_spin.connect("value-changed", self.on_page_spin)
+        self.page_spin.connect("activate", self.on_page_activate)
+        bar.pack_start(self.page_spin, False, False, 0)
+        self.page_total = Gtk.Label(label="/ –")
+        bar.pack_start(self.page_total, False, False, 4)
         bar.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL),
                        False, False, 4)
         button("−", lambda b: self.zoom(1 / 1.2), "Zoom out")
@@ -374,6 +387,7 @@ class App:
         if self.speaker:
             self.speaker.close()
         self.doc, self.pages, self.words = doc, pages, words
+        self.page_spin.get_adjustment().set_upper(doc.get_n_pages())
         self.path = path
         self.cursor_idx = 0
         self.active_range = None
@@ -391,16 +405,80 @@ class App:
         self.set_page(0)
         self.update_status()
 
-    def set_page(self, n):
+    def set_page(self, n, sync_spin=True):
         if not self.doc or not (0 <= n < self.doc.get_n_pages()):
             return
         self.page_no = n
         page = self.doc.get_page(n)
         w, h = page.get_size()
         self.canvas.set_size_request(int(w * self.scale), int(h * self.scale))
-        self.page_label.set_text(f"{n + 1} / {self.doc.get_n_pages()}")
+        if sync_spin:
+            self._syncing_page = True
+            self.page_spin.set_value(n + 1)
+            self._syncing_page = False
+        self.page_total.set_text(f"/ {self.doc.get_n_pages()}")
         self.canvas.queue_draw()
         self.update_status()
+
+    def first_word_on_page(self, n):
+        """Index of the first word on or after page n (skips empty pages)."""
+        for word in self.words:
+            if word.page >= n:
+                return word.index
+        return None
+
+    def jump_to_page(self, n):
+        """Move the view and the reading cursor to page n."""
+        if not self.doc or not (0 <= n < self.doc.get_n_pages()):
+            return
+        was_playing = bool(self.speaker and self.speaker.playing)
+        self.set_page(n)
+        if not self.speaker:
+            return
+        start = self.first_word_on_page(n)
+        if start is None:
+            self.speaker.stop()
+            return
+        self.cursor_idx = start
+        if was_playing:
+            self.speaker.play_from(start)
+        else:
+            self.speaker.cue(start)
+        self.canvas.queue_draw()
+        self.update_status()
+
+    def on_page_spin(self, spin):
+        # Debounce: typing "200" must not jump to page 2 and then 20.
+        if self._syncing_page or not self.doc:
+            return
+        if self._page_timer is not None:
+            GLib.source_remove(self._page_timer)
+        self._page_timer = GLib.timeout_add(300, self.commit_page_spin)
+
+    def on_page_activate(self, spin):
+        if self._page_timer is not None:
+            GLib.source_remove(self._page_timer)
+            self._page_timer = None
+        self.commit_page_spin()
+
+    def commit_page_spin(self):
+        self._page_timer = None
+        if not self.doc:
+            return False
+        # On Enter, GTK emits `activate` before it parses the entry text into
+        # the adjustment, so get_value() is still the old page.  Read the text
+        # directly and push the parsed value back before jumping.
+        text = self.page_spin.get_text().strip()
+        try:
+            number = int(float(text))
+        except ValueError:
+            number = int(self.page_spin.get_value())
+        number = max(1, min(self.doc.get_n_pages(), number))
+        self._syncing_page = True
+        self.page_spin.set_value(number)
+        self._syncing_page = False
+        self.jump_to_page(number - 1)
+        return False
 
     def zoom(self, factor):
         self.scale = max(0.5, min(4.0, self.scale * factor))
@@ -512,14 +590,17 @@ class App:
         name = Gdk.keyval_name(event.keyval)
         if event.state & Gdk.ModifierType.CONTROL_MASK and name == "o":
             self.choose_file()
+        elif self.page_spin.has_focus():
+            # Let the page entry handle typing, arrows and Enter itself.
+            return False
         elif name == "space":
             self.toggle_play()
         elif name in ("s", "S"):
             self.stop()
         elif name == "Left":
-            self.set_page(self.page_no - 1)
+            self.jump_to_page(self.page_no - 1)
         elif name == "Right":
-            self.set_page(self.page_no + 1)
+            self.jump_to_page(self.page_no + 1)
         else:
             return False
         return True

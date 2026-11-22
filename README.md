@@ -65,12 +65,20 @@ Voice model choice affects CPU load substantially: in testing,
 | Stop | `S` / Stop button |
 | Start reading from a word | click it |
 | Jump while listening | click another word |
-| Pages | `←` / `→` |
+| Jump to a page | type its number in the toolbar and press Enter |
+| Pages | `←` / `→`, prev/next buttons, or the page spinner |
 | Zoom / speed | toolbar |
 
 Clicking sets a blue outline on the word. The shaded yellow region is the
 utterance currently being spoken (up to two sentences). The view follows it
 onto the next page.
+
+Any page change — typed number, spinner arrows, buttons or arrow keys — also
+moves the reading cursor to the first extractable word on that page. If
+playback is active it continues from there; otherwise the reader stays paused
+and Play resumes from the new page. This prevents playback auto-follow from
+immediately undoing a manual jump. Pages without extractable text are skipped
+to the next page that has it.
 
 ## Architecture
 
