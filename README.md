@@ -3,15 +3,45 @@
 A deliberately small, Xpdf-like PDF reader whose only extra trick is reliable
 text-to-speech with play/pause and "read from here".
 
+Made with [OpenCode](https://opencode.ai/) using the **Big Pickle** model.
+
+Repository: https://github.com/David-Chatterton/pdf_speaker
+
 ## Run
 
 ```sh
 python3 pdf_speaker.py [some.pdf]
 ```
 
-No pip installs: GTK 3, Poppler Gi, `pdftotext` and the Python `speechd`
-bindings are already on this machine. It uses your existing speech-dispatcher
-piper configuration via the SSIP socket — no separate piper setup.
+## Dependencies
+
+Everything comes from the distro — there is nothing to `pip install`. The app
+is a speech-dispatcher client: it connects to the running daemon over its SSIP
+socket and sends it text. The piper voice and its model are configured in
+speech-dispatcher, **not** in this repository.
+
+| Requirement | Used for | Arch / CachyOS | Debian / Ubuntu |
+| --- | --- | --- | --- |
+| Python 3.8+ | application runtime | `python` | `python3` |
+| GTK 3 + PyGObject | UI (`Gtk`, `Gdk`, `GLib`) | `gtk3`, `python-gobject` | `gir1.2-gtk-3.0`, `python3-gi` |
+| Poppler GLib typelib | page rendering | `poppler-glib` | `gir1.2-poppler-0.18` |
+| pycairo | drawing the page and highlight | `python-cairo` | `python3-cairo` |
+| Poppler utils | word text + boxes via `pdftotext -bbox-layout` | `poppler` | `poppler-utils` |
+| Python speechd bindings | SSIP client | `speech-dispatcher` | `python3-speechd` |
+| speech-dispatcher daemon with a working module | synthesis | `speech-dispatcher` + piper | `speech-dispatcher` + piper |
+| `sox` | speed slider (`tempo $RATE` in piper.conf) | `sox` | `sox` |
+
+On Arch/CachyOS:
+
+```sh
+sudo pacman -S gtk3 python-gobject poppler-glib python-cairo poppler speech-dispatcher sox
+```
+
+The piper executable and voice models are installed separately (here they are
+managed by Pied via Flatpak). Any working speech-dispatcher output module will
+do; piper is simply what this setup uses. Voice model choice also matters for
+CPU load — `en_GB-cori-medium` is noticeably cheaper here than
+`en_GB-alan-medium`.
 
 ## Controls
 
@@ -88,6 +118,10 @@ bit more text on average. Both are one-line constants at the top of
 `pdf_speaker.py`; set `SENTENCES_PER_CHUNK = 1` if you want the old behaviour,
 or lower `MAX_WORDS_PER_CHUNK` if 45 words feels like too much to re-hear.
 
+Voice model choice matters more than any of this: switching from
+`en_GB-alan-medium` to `en_GB-cori-medium` reduced CPU load here far more than
+chunk tuning did.
+
 I would **not** replace the audio pipeline just to remove the gap. Doing so
 ( piper → WAV → mpv IPC ) would give gapless playback and exact pause, but it
 duplicates your voice configuration, adds a second playback stack and a new
@@ -108,22 +142,17 @@ $RATE = (ssip_rate * GenericRateMultiply) + GenericRateAdd
 speechd.conf.) So SSIP rate 0 is 1.0×, +100 is 2.0×, −50 is 0.5×. The app
 converts the displayed multiplier back to SSIP rate.
 
-**Why it did nothing before:** `sox` is not installed on this laptop. Your
-piper.conf tests `command -v sox`; when it is missing, the pipeline falls back
-to `PROCESS='cat'` and `$RATE` is simply discarded. The SSIP command was being
-sent correctly all along.
+**Why it did nothing at first:** `sox` was not installed. piper.conf tests
+`command -v sox`; when it is missing, the pipeline falls back to `PROCESS='cat'`
+and `$RATE` is simply discarded. The SSIP command was being sent correctly all
+along. Installing `sox` (`sudo pacman -S sox` on Arch/CachyOS) activates the
+existing `sox ... tempo $RATE` branch.
 
-Two ways to fix it (neither touches this app):
-
-1. Install sox: `sudo apt install sox` (or your distro equivalent). The
-   existing `sox ... tempo $RATE` branch then activates.
-2. Or add `--length-scale $RATE` to the piper invocation in
-   `~/.config/speech-dispatcher/modules/piper.conf`, which uses piper's own
-   rate control and needs no extra package. Note this changes speed for
-   *all* speech-dispatcher clients, not just this reader.
-
-Until one of those is done, moving the slider shows a one-time hint in the
-status bar.
+The alternative, if you would rather avoid the extra package, is to add
+`--length-scale $RATE` to the piper invocation in `piper.conf` — piper's own
+rate control. Note that either change affects *all* speech-dispatcher clients,
+not just this reader. The app shows a one-time hint in the status bar if it
+detects that neither fix is in place.
 
 ## Deliberately left out
 
