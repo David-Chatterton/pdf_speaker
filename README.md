@@ -13,12 +13,25 @@ Repository: https://github.com/David-Chatterton/pdf_speaker
 python3 pdf_speaker.py [some.pdf]
 ```
 
+### Dark desktop themes
+
+PDF pages are rendered with a transparent background. Under a dark GTK theme,
+the dark window background can show through, leaving black text on a black
+page. The simplest workaround is to launch the application with a light GTK
+theme:
+
+```sh
+GTK_THEME=Adwaita:light python3 pdf_speaker.py some.pdf
+```
+
+This is useful on Plasma desktops using Breeze Dark. No code change is needed.
+
 ## Dependencies
 
-Everything comes from the distro — there is nothing to `pip install`. The app
-is a speech-dispatcher client: it connects to the running daemon over its SSIP
-socket and sends it text. The piper voice and its model are configured in
-speech-dispatcher, **not** in this repository.
+All dependencies are provided by the distribution; there is nothing to
+`pip install`. The application is a speech-dispatcher client: it connects to
+the running daemon over its SSIP socket and sends text to it. The synthesizer
+and its voices are configured in speech-dispatcher, **not** in this repository.
 
 | Requirement | Used for | Arch / CachyOS | Debian / Ubuntu |
 | --- | --- | --- | --- |
@@ -28,8 +41,8 @@ speech-dispatcher, **not** in this repository.
 | pycairo | drawing the page and highlight | `python-cairo` | `python3-cairo` |
 | Poppler utils | word text + boxes via `pdftotext -bbox-layout` | `poppler` | `poppler-utils` |
 | Python speechd bindings | SSIP client | `speech-dispatcher` | `python3-speechd` |
-| speech-dispatcher daemon with a working module | synthesis | `speech-dispatcher` + piper | `speech-dispatcher` + piper |
-| `sox` | speed slider (`tempo $RATE` in piper.conf) | `sox` | `sox` |
+| speech-dispatcher daemon with a working module | synthesis | `speech-dispatcher` + synthesizer | `speech-dispatcher` + synthesizer |
+| `sox` | speed slider (`tempo $RATE` in the module config) | `sox` | `sox` |
 
 On Arch/CachyOS:
 
@@ -37,11 +50,11 @@ On Arch/CachyOS:
 sudo pacman -S gtk3 python-gobject poppler-glib python-cairo poppler speech-dispatcher sox
 ```
 
-The piper executable and voice models are installed separately (here they are
-managed by Pied via Flatpak). Any working speech-dispatcher output module will
-do; piper is simply what this setup uses. Voice model choice also matters for
-CPU load — `en_GB-cori-medium` is noticeably cheaper here than
-`en_GB-alan-medium`.
+The synthesizer executable and voice models are installed separately (the
+original setup uses Pied via Flatpak). Any working speech-dispatcher output
+module will do; piper is simply what this project was developed against.
+Voice model choice affects CPU load substantially: in testing,
+`en_GB-cori-medium` was noticeably cheaper than `en_GB-alan-medium`.
 
 ## Controls
 
@@ -56,8 +69,8 @@ CPU load — `en_GB-cori-medium` is noticeably cheaper here than
 | Zoom / speed | toolbar |
 
 Clicking sets a blue outline on the word. The shaded yellow region is the
-utterance currently being spoken (now up to two sentences). The view follows
-it onto the next page.
+utterance currently being spoken (up to two sentences). The view follows it
+onto the next page.
 
 ## Architecture
 
@@ -89,14 +102,14 @@ pdftotext -bbox-layout  ->  word stream (text + PDF coordinates)
 
 ## Why pause is implemented as stop + re-speak
 
-Your `~/.config/speech-dispatcher/modules/piper.conf` uses `sd_generic` to run
-piper and pipe raw audio straight into `paplay`. The whole message becomes one
-opaque audio stream that speech-dispatcher has no control over once it starts
-— its SSIP `PAUSE`/`RESUME` commands cannot stop those samples. Okular's flaky
-resume comes from the same place.
+A typical piper setup uses `sd_generic` to run piper and pipe raw audio
+straight into `paplay`. The whole message becomes one opaque audio stream that
+speech-dispatcher has no control over once it starts — its SSIP `PAUSE` and
+`RESUME` commands cannot stop those samples. This is also why applications
+such as Okular can behave unreliably when resuming with such a module.
 
-So instead of pretending we have sample-accurate pause, we speak one chunk at
-a time:
+Instead of pretending to have sample-accurate pause, the reader speaks one
+chunk at a time:
 
 * **pause** — `STOP` the current utterance, remember its chunk index;
 * **resume** — re-speak that chunk from its beginning;
@@ -104,63 +117,65 @@ a time:
 
 Resume always works; the cost is at most one repeated chunk.
 
-### The between-sentence gap, and what was changed
+### The between-utterance gap
 
-Your piper log shows `Loaded voice in ~0.63 second(s)` on **every** utterance.
-That is the pause you hear — piper is a fresh process per speech message.
+Piper loads its voice for every utterance when it is invoked as a separate
+process; a measured load time was around 0.63 s. That is the source of the
+pause between sentences.
 
-The low-risk fix, now applied, is to group two sentences into each utterance
-(`SENTENCES_PER_CHUNK = 2`) while keeping the original 45-word ceiling. On the
-test PDF that cuts the number of voice loads by about 31% (941 → 652
-utterances) with **no increase in worst-case pause rewind** — 45 words either
-way. The average utterance grows from 23 to 33 words, so a pause re-speaks a
-bit more text on average. Both are one-line constants at the top of
-`pdf_speaker.py`; set `SENTENCES_PER_CHUNK = 1` if you want the old behaviour,
-or lower `MAX_WORDS_PER_CHUNK` if 45 words feels like too much to re-hear.
+The low-risk mitigation used in this project is to group two sentences into each
+utterance (`SENTENCES_PER_CHUNK = 2`) while keeping a 45-word ceiling
+(`MAX_WORDS_PER_CHUNK = 45`). On the test PDF that reduced the number of voice
+loads by about 31% (941 → 652 utterances) with no increase in worst-case pause
+rewind — 45 words either way. The average utterance grows from 23 to 33 words,
+so a pause re-speaks slightly more text on average. Both are one-line
+constants at the top of `pdf_speaker.py`; setting `SENTENCES_PER_CHUNK = 1`
+restores the original behaviour, and lowering `MAX_WORDS_PER_CHUNK` reduces
+the rewind further.
 
-Voice model choice matters more than any of this: switching from
-`en_GB-alan-medium` to `en_GB-cori-medium` reduced CPU load here far more than
-chunk tuning did.
-
-I would **not** replace the audio pipeline just to remove the gap. Doing so
-( piper → WAV → mpv IPC ) would give gapless playback and exact pause, but it
-duplicates your voice configuration, adds a second playback stack and a new
-set of failure modes. Not worth it unless the grouped version still bothers
-you — see Possible next steps.
+Replacing the audio pipeline (piper → WAV → mpv IPC) would give gapless
+playback and exact pause, but it duplicates the voice configuration, adds a
+second playback stack and introduces new failure modes. It is not worth doing
+solely to remove the gap — see Possible next steps.
 
 ## Speed slider
 
-The slider is a playback multiplier, 0.5×–2×. This maps exactly onto your
-speech-dispatcher configuration:
+The slider is a playback multiplier, 0.5×–2×. This maps exactly onto a
+speech-dispatcher module configured with `GenericRateAdd 1` and
+`GenericRateMultiply 1`:
 
 ```
 $RATE = (ssip_rate * GenericRateMultiply) + GenericRateAdd
       = (ssip_rate * 0.01) + 1
 ```
 
-(`GenericRateMultiply 1` means 0.01 — the multiply values are written ×100 in
-speechd.conf.) So SSIP rate 0 is 1.0×, +100 is 2.0×, −50 is 0.5×. The app
+(`GenericRateMultiply 1` means 0.01 — multiply values are written ×100 in
+`speechd.conf`.) So SSIP rate 0 is 1.0×, +100 is 2.0×, −50 is 0.5×. The app
 converts the displayed multiplier back to SSIP rate.
 
-**Why it did nothing at first:** `sox` was not installed. piper.conf tests
-`command -v sox`; when it is missing, the pipeline falls back to `PROCESS='cat'`
-and `$RATE` is simply discarded. The SSIP command was being sent correctly all
-along. Installing `sox` (`sudo pacman -S sox` on Arch/CachyOS) activates the
-existing `sox ... tempo $RATE` branch.
+The speed slider needs the synthesizer module to apply `$RATE`. A piper module
+that checks `command -v sox` falls back to `PROCESS='cat'` when sox is absent,
+and `$RATE` is then discarded. Installing sox activates the existing
+`sox ... tempo $RATE` branch:
 
-The alternative, if you would rather avoid the extra package, is to add
-`--length-scale $RATE` to the piper invocation in `piper.conf` — piper's own
-rate control. Note that either change affects *all* speech-dispatcher clients,
-not just this reader. The app shows a one-time hint in the status bar if it
-detects that neither fix is in place.
+```sh
+sudo pacman -S sox    # Arch/CachyOS
+sudo apt install sox  # Debian/Ubuntu
+```
+
+Alternatively, add `--length-scale $RATE` to the piper invocation in
+`speechd.conf`'s module configuration — piper's own rate control, with no
+extra package. Either change affects *all* speech-dispatcher clients, not just
+this reader. The app shows a one-time hint in the status bar if it detects
+that neither fix is in place.
 
 ## Deliberately left out
 
-* Word-level karaoke highlighting — SSIP gives no word timings, so we shade
-  the current utterance rather than fake a position inside it.
+* Word-level karaoke highlighting — SSIP gives no word timings, so the current
+  utterance is shaded rather than faking a position inside it.
 * Bookmarks, saved position, search, annotations, reflow, multi-column
   heuristics, encrypted PDFs, continuous scrolling.
-* Voice selection UI — set it in speech-dispatcher as you already have.
+* Voice selection UI — configure the voice in speech-dispatcher.
 
 ## Possible next steps
 
