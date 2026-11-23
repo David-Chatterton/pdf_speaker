@@ -1,28 +1,35 @@
 #!/usr/bin/env python3
 """A deliberately small PDF reader with reliable TTS play/pause.
 
-Design constraint: with the sd_generic -> piper -> paplay module, a speech
-message is one opaque audio stream.  speech-dispatcher cannot pause it.
-So we speak one sentence at a time and implement pause as "stop the current
+Two speech backends are available.  The default sends text to OpenRouter's
+hexgrad/kokoro-82m endpoint and plays the returned mp3 with mpv; --backend
+speechd keeps the original speech-dispatcher client.  In both cases a spoken
+message is one opaque audio stream that cannot be paused mid-sample, so the
+reader speaks one sentence at a time and implements pause as "stop the current
 chunk, resume it from its beginning".  Predictable beats sample-accurate here.
 Sentences are never split merely for length; only unpunctuated runs such as
 indexes get broken up by a generous safety ceiling.
 """
 
 import argparse
+import json
+import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
+import time
+import urllib.error
+import urllib.request
 import xml.etree.ElementTree as ET
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
 import cairo
 import gi
-import speechd
-from speechd import CallbackType
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
@@ -35,6 +42,13 @@ from gi.repository import Gdk, GLib, Gtk, Poppler
 MAX_WORDS_PER_CHUNK = 500
 DEFAULT_SCALE = 1.4          # pixels per PDF point (~100 dpi)
 SENTENCE_END = re.compile(r"[.!?][\"'\u2019\u201d)\]]*$")
+
+# OpenRouter text-to-speech settings.  The key is read from the environment at
+# runtime; it is never stored in this repository or in a config file.
+OPENROUTER_URL = "https://openrouter.ai/api/v1/audio/speech"
+OPENROUTER_MODEL = "hexgrad/kokoro-82m"
+OPENROUTER_VOICE = "bf_emma"
+AUDIO_CACHE_SIZE = 8          # remembered sentences, for pause/resume and prefetch
 
 
 # --------------------------------------------------------------------------
@@ -132,17 +146,248 @@ def make_chunks(words, start=0, max_words=MAX_WORDS_PER_CHUNK):
 
 
 # --------------------------------------------------------------------------
-# Speech controller.  Runs no threads of its own: speechd delivers END /
-# CANCEL on its own thread, and we marshal everything back to GTK's main loop.
+# Speech engines.  Both offer the same small interface: speak(text, done,
+# failed), cancel(), stop(), prefetch(text, speed), set_rate(multiplier) and
+# close().  Engines never touch GTK; completion is reported through callbacks
+# that Speaker marshals onto GTK's main loop.
+# --------------------------------------------------------------------------
+
+class TTSException(Exception):
+    """A speech engine could not produce or play audio."""
+
+
+class OpenRouterEngine:
+    """Fetch mp3 from OpenRouter and play it with mpv.
+
+    HTTP and playback happen in worker threads so the UI never blocks.  Audio
+    is cached by (text, speed), which makes resume free and allows the next
+    sentence to be fetched while the current one is still playing.
+    """
+
+    def __init__(self):
+        self.api_key = os.environ.get("OPENROUTER_API_KEY", "").strip()
+        self.player_bin = shutil.which("mpv")
+        self.rate = 1.0
+        self.tmpdir = tempfile.mkdtemp(prefix="pdf_speaker_or_")
+        self.cache = OrderedDict()
+        self.cache_lock = threading.Lock()
+        self.pending = set()
+        self.generation = 0
+        self.player = None
+        self.player_lock = threading.Lock()
+
+    def set_rate(self, multiplier):
+        self.rate = max(0.25, min(4.0, float(multiplier)))
+
+    def _fetch(self, text, speed):
+        if not self.api_key:
+            raise TTSException("OPENROUTER_API_KEY is not set")
+        if not self.player_bin:
+            raise TTSException("mpv is required to play OpenRouter audio")
+        body = json.dumps({
+            "model": OPENROUTER_MODEL,
+            "input": text,
+            "voice": OPENROUTER_VOICE,
+            "response_format": "mp3",
+            "speed": round(speed, 2),
+        }).encode("utf-8")
+        request = urllib.request.Request(
+            OPENROUTER_URL, data=body, method="POST",
+            headers={
+                "Authorization": "Bearer " + self.api_key,
+                "Content-Type": "application/json",
+                "Accept": "audio/mpeg",
+            },
+        )
+        for attempt in range(2):
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    data = response.read()
+                if not data:
+                    raise TTSException("OpenRouter returned no audio")
+                return data
+            except urllib.error.HTTPError as exc:
+                detail = ""
+                try:
+                    error = json.loads(exc.read().decode("utf-8")).get("error", {})
+                    detail = error.get("message", "")
+                except Exception:
+                    pass
+                if exc.code in (429, 502) and attempt == 0:
+                    time.sleep(1)
+                    continue
+                raise TTSException(
+                    f"OpenRouter HTTP {exc.code}: {detail or exc.reason}")
+            except urllib.error.URLError as exc:
+                if attempt == 0:
+                    time.sleep(1)
+                    continue
+                raise TTSException(f"OpenRouter unreachable: {exc.reason}")
+
+    @staticmethod
+    def _key(text, speed):
+        return text, round(speed, 2)
+
+    def _cached_path(self, key):
+        with self.cache_lock:
+            if key not in self.cache:
+                return None
+            self.cache.move_to_end(key)
+            return self.cache[key]
+
+    def _store(self, key, data):
+        with self.cache_lock:
+            if key in self.cache:
+                self.cache.move_to_end(key)
+                return self.cache[key]
+            fd, path = tempfile.mkstemp(suffix=".mp3", dir=self.tmpdir)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+            self.cache[key] = path
+            while len(self.cache) > AUDIO_CACHE_SIZE:
+                _, old = self.cache.popitem(last=False)
+                try:
+                    os.unlink(old)
+                except OSError:
+                    pass
+            return path
+
+    def prefetch(self, text, speed):
+        key = self._key(text, speed)
+        if not self.api_key or self._cached_path(key):
+            return
+        with self.cache_lock:
+            if key in self.pending:
+                return
+            self.pending.add(key)
+        generation = self.generation
+        threading.Thread(target=self._prefetch_run,
+                         args=(text, speed, key, generation),
+                         daemon=True).start()
+
+    def _prefetch_run(self, text, speed, key, generation):
+        try:
+            data = self._fetch(text, speed)
+            if generation == self.generation:
+                self._store(key, data)
+        except Exception:
+            pass                      # prefetch is best-effort
+        finally:
+            with self.cache_lock:
+                self.pending.discard(key)
+
+    def speak(self, text, on_done, on_error):
+        speed = self.rate
+        key = self._key(text, speed)
+        generation = self.generation
+        threading.Thread(target=self._speak_run,
+                         args=(text, speed, key, generation, on_done, on_error),
+                         daemon=True).start()
+
+    def _speak_run(self, text, speed, key, generation, on_done, on_error):
+        try:
+            path = self._cached_path(key)
+            if path is None:
+                data = self._fetch(text, speed)
+                if generation != self.generation:
+                    return
+                path = self._store(key, data)
+            if generation != self.generation:
+                return
+            command = [self.player_bin, "--no-video", "--quiet",
+                       "--no-terminal", "--force-window=no", path]
+            process = subprocess.Popen(command,
+                                       stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL)
+            with self.player_lock:
+                self.player = process
+            if generation != self.generation:
+                process.terminate()
+                return
+            status = process.wait()
+            with self.player_lock:
+                if self.player is process:
+                    self.player = None
+            if generation == self.generation and status == 0:
+                GLib.idle_add(on_done)
+        except Exception as exc:
+            if generation == self.generation:
+                GLib.idle_add(on_error, str(exc))
+
+    def _cancel(self):
+        self.generation += 1
+        with self.player_lock:
+            process = self.player
+            self.player = None
+        if process is not None and process.poll() is None:
+            process.terminate()
+
+    def cancel(self):
+        self._cancel()
+
+    def stop(self):
+        self._cancel()
+
+    def close(self):
+        self._cancel()
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+
+class SpeechdEngine:
+    """The original backend: speech-dispatcher over its SSIP socket."""
+
+    def __init__(self):
+        import speechd
+        self.speechd = speechd
+        self.client = speechd.SSIPClient("pdf-speaker")
+        self.client.set_priority(speechd.Priority.TEXT)
+        self.rate = 1.0
+
+    def set_rate(self, multiplier):
+        self.rate = float(multiplier)
+        self.client.set_rate(int(round((multiplier - 1.0) * 100)))
+
+    def speak(self, text, on_done, on_error):
+        def callback(event_type):
+            if event_type == self.speechd.CallbackType.END:
+                on_done()
+        self.client.speak(
+            text,
+            callback=callback,
+            event_types=(self.speechd.CallbackType.END,
+                         self.speechd.CallbackType.CANCEL),
+        )
+
+    def cancel(self):
+        self.client.cancel()
+
+    def stop(self):
+        self.client.stop()
+
+    @staticmethod
+    def prefetch(text, speed):
+        pass                          # speechd has nothing to prepare
+
+    def close(self):
+        try:
+            self.client.cancel()
+            self.client.close()
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------
+# Speech controller: chunk bookkeeping, play/pause state and stale-event guard.
+# Engine-specific work (HTTP, playback, SSIP) lives in the engines above.
 # --------------------------------------------------------------------------
 
 class Speaker:
-    def __init__(self, words, on_chunk, on_state):
+    def __init__(self, words, on_chunk, on_state, engine, on_error=None):
         self.words = words
         self.on_chunk = on_chunk
         self.on_state = on_state
-        self.client = speechd.SSIPClient("pdf-speaker")
-        self.client.set_priority(speechd.Priority.TEXT)
+        self.on_error = on_error or (lambda message: None)
+        self.engine = engine
         self.chunks = []
         self.idx = 0
         self.playing = False
@@ -150,22 +395,19 @@ class Speaker:
         self.lock = threading.Lock()
 
     # -- internal ---------------------------------------------------------
-    def _event(self, event_type, epoch):
-        GLib.idle_add(self._event_main, event_type, epoch)
+    def _event(self, epoch):
+        GLib.idle_add(self._event_main, epoch)
 
-    def _event_main(self, event_type, epoch):
+    def _event_main(self, epoch):
         with self.lock:
             if epoch != self.epoch or not self.playing:
                 return False
-            if event_type == CallbackType.END:
-                self.idx += 1
-                if self.idx >= len(self.chunks):
-                    self.playing = False
-                    done = True
-                else:
-                    done = False
+            self.idx += 1
+            if self.idx >= len(self.chunks):
+                self.playing = False
+                done = True
             else:
-                return False
+                done = False
         if done:
             self.on_state(False)
             self.on_chunk(None)
@@ -173,19 +415,30 @@ class Speaker:
             self._speak_current()
         return False
 
+    def _error(self, message, epoch):
+        with self.lock:
+            if epoch != self.epoch:
+                return
+            self.playing = False
+            self.epoch += 1
+        self.on_state(False)
+        self.on_chunk(None)
+        self.on_error(message)
+
     def _speak_current(self):
         with self.lock:
             if not self.playing or self.idx >= len(self.chunks):
                 return
             start, end, text = self.chunks[self.idx]
             epoch = self.epoch
+            following = (self.chunks[self.idx + 1][2]
+                         if self.idx + 1 < len(self.chunks) else None)
         self.on_chunk((start, end))
-        # Must not call back into SSIP from the callback thread -> idle_add.
-        self.client.speak(
-            text,
-            callback=lambda event_type, e=epoch: self._event(event_type, e),
-            event_types=(CallbackType.END, CallbackType.CANCEL),
-        )
+        self.engine.speak(text,
+                          lambda e=epoch: self._event(e),
+                          lambda message, e=epoch: self._error(message, e))
+        if following:
+            self.engine.prefetch(following, self.engine.rate)
 
     # -- public -----------------------------------------------------------
     def cue(self, word_index):
@@ -195,7 +448,7 @@ class Speaker:
             self.playing = False
             self.chunks = make_chunks(self.words, word_index)
             self.idx = 0
-        self.client.cancel()
+        self.engine.cancel()
         self.on_chunk(None)
         self.on_state(False)
 
@@ -228,7 +481,7 @@ class Speaker:
                 return
             self.playing = False
             self.epoch += 1          # self.idx still points at this chunk
-        self.client.stop()
+        self.engine.stop()
         self.on_state(False)
         # Keep the interrupted sentence visible: that is where resume will
         # start from.  on_chunk also scrolls its page into view if needed.
@@ -243,16 +496,15 @@ class Speaker:
             self.epoch += 1
             self.chunks = []
             self.idx = 0
-        self.client.cancel()
+        self.engine.cancel()
         self.on_state(False)
         self.on_chunk(None)
 
+    def set_rate(self, multiplier):
+        self.engine.set_rate(multiplier)
+
     def close(self):
-        try:
-            self.client.cancel()
-            self.client.close()
-        except Exception:
-            pass
+        self.engine.close()
 
 
 # --------------------------------------------------------------------------
@@ -260,7 +512,8 @@ class Speaker:
 # --------------------------------------------------------------------------
 
 class App:
-    def __init__(self, path=None):
+    def __init__(self, path=None, backend="openrouter"):
+        self.backend = backend
         self.doc = None
         self.pages = []
         self.words = []
@@ -380,15 +633,19 @@ class App:
         self.cursor_idx = 0
         self.active_range = None
         try:
-            self.speaker = Speaker(words, self.on_chunk, self.on_state)
+            if self.backend == "openrouter":
+                engine = OpenRouterEngine()
+            else:
+                engine = SpeechdEngine()
+            self.speaker = Speaker(words, self.on_chunk, self.on_state,
+                                   engine, self.on_speech_error)
         except Exception as exc:
             self.speaker = None
-            self.error("Speech Dispatcher unavailable", str(exc))
+            name = "OpenRouter" if self.backend == "openrouter" \
+                else "Speech Dispatcher"
+            self.error(f"{name} unavailable", str(exc))
         else:
-            try:
-                self.apply_rate()
-            except Exception:
-                pass
+            self.apply_rate()
         self.window.set_title("PDF Speaker – " + path.rsplit("/", 1)[-1])
         self.set_page(0)
         self.update_status()
@@ -547,22 +804,20 @@ class App:
         self.update_status()
 
     def apply_rate(self):
-        """Convert the 0.5–2.0 multiplier to SSIP's -100..100 rate.
-
-        In this piper.conf, GenericRateMultiply 1 / GenericRateAdd 1 give
-        $RATE = (ssip_rate * 0.01) + 1, so the two scales line up exactly.
-        """
-        if not self.speaker:
-            return
-        multiplier = self.rate.get_value()
-        self.speaker.client.set_rate(int(round((multiplier - 1.0) * 100)))
+        """Pass the 0.5–2.0 multiplier to the active engine."""
+        if self.speaker:
+            self.speaker.set_rate(self.rate.get_value())
 
     def on_rate(self, scale):
         self.apply_rate()
-        if not rate_is_wired() and not self.rate_warned:
+        if self.backend == "speechd" and not rate_is_wired() \
+                and not self.rate_warned:
             self.rate_warned = True
             self.status.push(1, "Speed needs sox, or --length-scale $RATE "
                                 "in piper.conf — see README")
+
+    def on_speech_error(self, message):
+        self.status.push(1, "Speech error: " + message.splitlines()[0][:180])
 
     # -- misc -------------------------------------------------------------
     def update_status(self):
@@ -607,14 +862,19 @@ class App:
 
     def run(self):
         self.window.show_all()
+        if self.backend == "openrouter" and not os.environ.get("OPENROUTER_API_KEY"):
+            self.status.push(1, "Set OPENROUTER_API_KEY to enable speech")
         Gtk.main()
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("pdf", nargs="?", help="PDF file to open")
+    parser.add_argument("--backend", choices=("openrouter", "speechd"),
+                        default="openrouter",
+                        help="TTS backend (default: openrouter)")
     args = parser.parse_args()
-    App(args.pdf).run()
+    App(args.pdf, args.backend).run()
 
 
 if __name__ == "__main__":
